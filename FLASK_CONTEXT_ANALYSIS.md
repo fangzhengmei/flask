@@ -10,6 +10,7 @@
    - [4.6 Teardown 回调机制详解](#46-teardown-回调机制详解)
    - [4.7 Token Reset 的异常清理保证机制](#47-token-reset-的异常清理保证机制)
    - [4.8 Blinker 信号系统详解](#48-blinker-信号系统详解)
+   - [4.9 跨线程上下文传递：`copy_current_request_context` 与 `contextvars.copy_context()`](#49-跨线程上下文传递copy_current_request_context-与-contexvarscopy_context)
 5. [LocalProxy 透明代理原理](#5-localproxy-透明代理原理)
 6. [上下文生命周期管理](#6-上下文生命周期管理)
 7. [为什么并发时不会"串"数据？](#7-为什么并发时不会串数据)
