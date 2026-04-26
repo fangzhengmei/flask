@@ -962,6 +962,1009 @@ def pop(self, exc=None):
 
 ---
 
+## 4.8 Blinker 信号系统详解
+
+### 4.8.1 什么是 Blinker？
+
+**Blinker** 是一个轻量级的 Python 信号/事件派发库，提供：
+- 命名信号注册表
+- 发送者/接收者解耦
+- 线程安全
+- 异步接收器支持
+
+Flask 从 0.6 版本开始集成 Blinker，用于在请求生命周期的各个节点发送通知。
+
+### 4.8.2 Flask 如何接入 Blinker
+
+**`src/flask/signals.py` 的核心实现：**
+
+```python
+# src/flask/signals.py
+
+from blinker import Namespace
+
+# 为 Flask 内置信号创建独立的命名空间
+# 这确保 Flask 的信号不会与其他库冲突
+_signals = Namespace()
+
+# ========== 定义所有内置信号 ==========
+
+# 模板渲染相关
+template_rendered = _signals.signal("template-rendered")
+before_render_template = _signals.signal("before-render-template")
+
+# 请求生命周期相关
+request_started = _signals.signal("request-started")
+request_finished = _signals.signal("request-finished")
+request_tearing_down = _signals.signal("request-tearing-down")
+got_request_exception = _signals.signal("got-request-exception")
+
+# 应用上下文生命周期相关
+appcontext_tearing_down = _signals.signal("appcontext-tearing-down")
+appcontext_pushed = _signals.signal("appcontext-pushed")
+appcontext_popped = _signals.signal("appcontext-popped")
+
+# 消息闪现相关
+message_flashed = _signals.signal("message-flashed")
+```
+
+**Namespace 的作用：**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Blinker 信号系统架构                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  全局信号（通过 signal('name') 创建）                             │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  signal('initialized')                                    │   │
+│  │  signal('data-changed')                                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                   │
+│  Flask 命名空间（隔离）                                           │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Namespace()                                              │   │
+│  │  ├─► 'template-rendered'   (template_rendered)          │   │
+│  │  ├─► 'request-started'     (request_started)            │   │
+│  │  ├─► 'appcontext-pushed'   (appcontext_pushed)          │   │
+│  │  └─► ...                                                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                   │
+│  其他扩展的命名空间（互不干扰）                                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  SQLAlchemy Namespace                                     │   │
+│  │  └─► 'before_flush', 'after_commit', ...                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.8.3 信号监听器的注册方式
+
+**方式 1：`connect()` / `disconnect()` 方法**
+
+```python
+from flask import request_started, request_finished, current_app
+
+def on_request_started(sender, **extra):
+    """请求开始时调用
+    sender: Flask 应用实例
+    """
+    print(f"Request started for {sender.name}")
+
+def on_request_finished(sender, response, **extra):
+    """请求结束时调用
+    sender: Flask 应用实例
+    response: Response 对象
+    """
+    print(f"Request finished, status: {response.status}")
+
+# ========== 注册 ==========
+# 方式 A：监听所有应用的信号（不推荐，除非你知道你在做什么）
+request_started.connect(on_request_started)
+
+# 方式 B：只监听特定应用的信号（推荐！）
+app = Flask(__name__)
+request_started.connect(on_request_started, sender=app)
+request_finished.connect(on_request_finished, sender=app)
+
+# ========== 注销 ==========
+request_started.disconnect(on_request_started, sender=app)
+request_finished.disconnect(on_request_finished, sender=app)
+```
+
+**方式 2：`connect_via()` 装饰器（Blinker 1.1+）**
+
+```python
+from flask import template_rendered
+from flask import Flask
+
+app = Flask(__name__)
+
+# 使用装饰器直接订阅
+@template_rendered.connect_via(app)
+def on_template_rendered(sender, template, context, **extra):
+    """模板渲染后调用
+    template: 模板对象 (Jinja2 Template)
+    context: 模板上下文字典
+    """
+    print(f"Template rendered: {template.name}")
+```
+
+**方式 3：`connected_to()` 上下文管理器（临时订阅）**
+
+```python
+from flask import template_rendered
+from contextlib import contextmanager
+
+@contextmanager
+def capture_templates(app):
+    """临时捕获渲染的模板，用于测试"""
+    recorded = []
+    
+    def record(sender, template, context, **extra):
+        recorded.append((template, context))
+    
+    # 进入 with 块时连接
+    template_rendered.connect(record, sender=app)
+    try:
+        yield recorded
+    finally:
+        # 退出 with 块时断开
+        template_rendered.disconnect(record, sender=app)
+
+# 或者使用 Blinker 内置的 connected_to（更简洁）
+def capture_templates_v2(app, recorded):
+    def record(sender, template, context, **extra):
+        recorded.append((template, context))
+    # 返回一个上下文管理器
+    return template_rendered.connected_to(record, sender=app)
+
+# 使用方式
+with capture_templates(app) as templates:
+    client = app.test_client()
+    client.get('/')
+    print(f"Rendered {len(templates)} templates")
+```
+
+**方式 4：匿名信号的类属性方式**
+
+```python
+from blinker import Signal
+
+class MyPlugin:
+    """自定义信号的示例"""
+    
+    # 匿名信号，不通过 Namespace
+    on_initialized = Signal()
+    on_data_changed = Signal(doc="Called when data changes")
+    
+    def initialize(self):
+        self.on_initialized.send(self)
+    
+    def update_data(self, new_data):
+        self._data = new_data
+        self.on_data_changed.send(self, data=new_data)
+
+# 使用
+plugin = MyPlugin()
+
+@plugin.on_initialized.connect
+def on_init(sender):
+    print(f"Plugin {sender} initialized!")
+
+plugin.initialize()  # 触发信号
+```
+
+### 4.8.4 信号在 push/pop 中的触发时机
+
+**完整的信号触发时序图：**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      请求生命周期完整时序                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  wsgi_app() 入口                                                          │
+│       │                                                                   │
+│       ▼                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  ctx.push()                                                       │   │
+│  │    │                                                              │   │
+│  │    ├─► _cv_app.set(ctx)  ◄── ContextVar 设置                   │   │
+│  │    │                                                              │   │
+│  │    ├─► appcontext_pushed.send()  ◄─────── 第 1 个信号         │   │
+│  │    │         │                                                    │   │
+│  │    │         └─► 此时 current_app 已可用                         │   │
+│  │    │                                                              │   │
+│  │    ├─► (如果是请求上下文)                                         │   │
+│  │    │    ├─► session 加载                                          │   │
+│  │    │    └─► 路由匹配 (match_request)                              │   │
+│  │    │                                                              │   │
+│  └────┴─────────────────────────────────────────────────────────────┘   │
+│       │                                                                   │
+│       ▼                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  full_dispatch_request()                                          │   │
+│  │    │                                                              │   │
+│  │    ├─► request_started.send()  ◄────────── 第 2 个信号         │   │
+│  │    │         │                                                    │   │
+│  │    │         └─► 在 before_request 之前触发                       │   │
+│  │    │                                                              │   │
+│  │    ├─► preprocess_request()                                       │   │
+│  │    │    └─► 执行 @before_request 回调                             │   │
+│  │    │                                                              │   │
+│  │    ├─► dispatch_request()                                         │   │
+│  │    │    └─► 执行视图函数                                          │   │
+│  │    │         │                                                    │   │
+│  │    │         ├─► (模板渲染时)                                     │   │
+│  │    │         │    ├─► before_render_template.send()             │   │
+│  │    │         │    └─► template_rendered.send()                  │   │
+│  │    │         │                                                    │   │
+│  │    │         └─► (flash 消息时)                                  │   │
+│  │    │              └─► message_flashed.send()                    │   │
+│  │    │                                                              │   │
+│  │    ├─► (如果有异常)                                               │   │
+│  │    │    ├─► handle_user_exception()                              │   │
+│  │    │    └─► got_request_exception.send()  ◄── 第 3 个信号      │   │
+│  │    │                                                              │   │
+│  │    └─► finalize_request()                                        │   │
+│  │         ├─► process_response()                                    │   │
+│  │         │    └─► 执行 @after_request 回调                         │   │
+│  │         │                                                         │   │
+│  │         └─► request_finished.send()  ◄────────── 第 4 个信号    │   │
+│  │                                                                   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│       │                                                                   │
+│       ▼                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  ctx.pop(exc)                                                     │   │
+│  │    │                                                              │   │
+│  │    ├─► (如果是请求上下文)                                         │   │
+│  │    │    ├─► do_teardown_request()                                │   │
+│  │    │    │    ├─► 执行 @teardown_request 回调                     │   │
+│  │    │    │    └─► request_tearing_down.send()  ◄── 第 5 个信号  │   │
+│  │    │    │                                                         │   │
+│  │    │    └─► request.close()                                       │   │
+│  │    │                                                              │   │
+│  │    ├─► do_teardown_appcontext()                                  │   │
+│  │    │    ├─► 执行 @teardown_appcontext 回调                       │   │
+│  │    │    └─► appcontext_tearing_down.send()  ◄── 第 6 个信号     │   │
+│  │    │                                                              │   │
+│  │    ├─► _cv_app.reset()  ◄── ContextVar 恢复                     │   │
+│  │    │                                                              │   │
+│  │    └─► appcontext_popped.send()  ◄────────── 第 7 个信号        │   │
+│  │                                                                   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**信号触发位置（代码引用）：**
+
+| 信号 | 触发位置 | 文件行号 |
+|------|---------|---------|
+| `appcontext_pushed` | `AppContext.push()` 后 | `ctx.py:434` |
+| `request_started` | `full_dispatch_request()` 开始 | `app.py:1013` |
+| `got_request_exception` | 异常处理时 | `app.py:926` |
+| `request_finished` | `finalize_request()` 结束 | `app.py:1042` |
+| `request_tearing_down` | `do_teardown_request()` 后 | `app.py:1449` |
+| `appcontext_tearing_down` | `do_teardown_appcontext()` 后 | `app.py:1477` |
+| `appcontext_popped` | `AppContext.pop()` 最后 | `ctx.py:502` |
+
+### 4.8.5 信号与 Teardown 回调的区别
+
+这是一个非常关键的问题，让我们从多个维度对比：
+
+| 对比维度 | 信号 (Signals) | Teardown 回调 |
+|---------|---------------|---------------|
+| **触发时机** | 生命周期的多个节点 | 只在清理阶段 |
+| **返回值处理** | 收集但不使用 | 无返回值 |
+| **修改数据** | **禁止**（只通知） | 可以（虽然不推荐） |
+| **订阅方式** | 全局注册/临时订阅 | 装饰器注册到应用 |
+| **发送者过滤** | 支持（只监听特定 app） | 不支持（绑定到注册的 app） |
+| **异常处理** | 3.2 前：抛异常停止；3.2 后：收集所有 | 3.2 后：收集所有 |
+| **典型用途** | 监控、审计、日志、测试 | 资源清理（DB 连接等） |
+
+**详细对比 1：能否中断流程？**
+
+```python
+# ========== Teardown 回调：不能中断，但可以抛异常 ==========
+@app.teardown_request
+def my_teardown(exc):
+    # Teardown 主要用于清理
+    # 抛异常会被收集，但不会影响其他 teardown（Flask 3.2+）
+    db.session.remove()
+
+# ========== before_request：可以中断流程 ==========
+@app.before_request
+def check_auth():
+    # 可以返回响应，提前结束请求
+    if not g.user:
+        return "Unauthorized", 401  # 直接返回，视图不会执行
+
+# ========== 信号：绝对不能中断流程 ==========
+@request_started.connect_via(app)
+def audit_log(sender, **extra):
+    # 信号只能做"只读"操作
+    # 即使抛异常，也不会中断请求处理
+    # (Flask 3.2+ 会收集异常，在最后汇总抛出)
+    logger.info(f"Request started to {sender.name}")
+```
+
+**详细对比 2：临时订阅能力**
+
+```python
+# ========== 信号可以临时订阅（测试场景非常有用）==========
+from flask import template_rendered
+
+def test_rendered_templates(app):
+    """测试：验证某个请求渲染了哪些模板"""
+    templates = []
+    
+    def record(sender, template, context, **extra):
+        templates.append(template.name)
+    
+    # 只在这个测试中订阅
+    with template_rendered.connected_to(record, app):
+        client = app.test_client()
+        client.get('/dashboard')
+        
+        assert 'dashboard.html' in templates
+        assert 'sidebar.html' in templates
+    
+    # 退出 with 块后，自动取消订阅
+    # 其他测试不受影响
+
+# ========== Teardown 回调：无法临时订阅 ==========
+@app.teardown_request
+def cleanup(exc):
+    # 一旦注册，全局生效
+    # 无法在某个测试中临时"取消注册"
+    pass
+```
+
+**详细对比 3：参数传递**
+
+```python
+# ========== 信号：通过关键字参数传递额外信息 ==========
+
+# 发送时
+request_finished.send(self, response=response)
+message_flashed.send(self, message=message, category=category)
+
+# 接收时
+@request_finished.connect_via(app)
+def log_response(sender, response, **extra):
+    # 可以访问 response 对象
+    print(f"Response status: {response.status}")
+
+# 注意：必须用 **extra 接收未知参数！
+# 否则 Flask 新增参数时会报错
+@request_finished.connect_via(app)
+def bad_handler(sender, response):
+    # ❌ 危险！如果 Flask 新增参数，会抛 TypeError
+    pass
+
+# ========== Teardown 回调：固定参数 ==========
+
+@app.teardown_request
+def cleanup(exc):
+    # 只有一个 exc 参数
+    # - None: 正常结束
+    # - 异常对象: 有未处理的异常
+    if exc is None:
+        db.session.commit()
+    else:
+        db.session.rollback()
+    db.session.remove()
+```
+
+**详细对比 4：执行顺序**
+
+```
+请求结束时的完整执行顺序：
+
+1. finalize_request() 中的 process_response()
+   └─► @after_request 回调（按注册逆序执行）
+
+2. request_finished.send()
+   └─► 所有订阅的信号处理器
+
+3. ctx.pop() 开始
+   │
+   ├─► do_teardown_request()
+   │    ├─► @teardown_request 回调（蓝图级 → 应用级）
+   │    └─► request_tearing_down.send()
+   │
+   ├─► do_teardown_appcontext()
+   │    ├─► @teardown_appcontext 回调
+   │    └─► appcontext_tearing_down.send()
+   │
+   ├─► _cv_app.reset()
+   │
+   └─► appcontext_popped.send()
+```
+
+### 4.8.6 异步信号支持 (`_async_wrapper`)
+
+你可能注意到了 Flask 发送信号时的特殊参数：
+
+```python
+appcontext_pushed.send(
+    self.app, 
+    _async_wrapper=self.app.ensure_sync  # ← 这是什么？
+)
+```
+
+**背景：Blinker 1.8+ 支持异步接收器**
+
+```python
+# Blinker 原生支持
+from blinker import Signal
+
+sig = Signal()
+
+# 同步接收器
+def sync_receiver(sender, **extra):
+    print("Sync handler")
+
+# 异步接收器
+async def async_receiver(sender, **extra):
+    await some_async_operation()
+
+# 注册
+sig.connect(sync_receiver)
+sig.connect(async_receiver)
+
+# 发送给同步接收器：用 send()
+sig.send(sender)
+
+# 发送给异步接收器：用 send_async()
+await sig.send_async(sender)
+```
+
+**问题：Flask 是 WSGI 应用（同步），如何支持异步接收器？**
+
+**解决方案：`_async_wrapper` 参数**
+
+```python
+# Flask 的 ensure_sync 方法
+def ensure_sync(self, func):
+    """将异步函数包装为同步函数"""
+    if iscoroutinefunction(func):
+        # 如果是 async def，用 async_to_sync 包装
+        return self.async_to_sync(func)
+    # 同步函数直接返回
+    return func
+
+# 信号发送时
+request_started.send(
+    self, 
+    _async_wrapper=self.ensure_sync
+)
+```
+
+**Blinker 内部如何处理 `_async_wrapper`：**
+
+```python
+# Blinker Signal.send() 伪代码
+def send(self, sender, *, _async_wrapper=None, **kwargs):
+    results = []
+    for receiver in self.receivers_for(sender):
+        # 如果有 _async_wrapper，用它包装接收器
+        if _async_wrapper is not None:
+            receiver = _async_wrapper(receiver)
+        
+        # 调用接收器
+        result = receiver(sender, **kwargs)
+        results.append((receiver, result))
+    return results
+```
+
+**实际使用示例：**
+
+```python
+from flask import Flask, request_started
+
+app = Flask(__name__)
+
+# 同步接收器（正常使用）
+@request_started.connect_via(app)
+def sync_handler(sender, **extra):
+    print("Request started (sync)")
+
+# 异步接收器（需要 Flask 2.0+ 的 async 支持）
+@request_started.connect_via(app)
+async def async_handler(sender, **extra):
+    # 这里的 await 会被 ensure_sync 包装
+    await some_async_logging("Request started")
+```
+
+---
+
+### 4.8.6.1 `ensure_sync` 异步适配器深度解析
+
+**问题背景：Flask 是同步 WSGI 应用，但用户想写异步代码**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        冲突场景                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  Flask 2.0+ 想支持这样的写法：                                     │
+│                                                                   │
+│  @app.route('/')                                                 │
+│  async def index():        ← 用户想用 async def                 │
+│      await async_db.query()                                       │
+│      return 'Hello'                                               │
+│                                                                   │
+│  但 WSGI 服务器是同步的：                                         │
+│                                                                   │
+│  def wsgi_app(self, environ, start_response):  ← 同步入口       │
+│      # 这里不能直接 await！                                       │
+│      response = view_function()   ← 同步调用                     │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**解决方案：`ensure_sync` + `async_to_sync` 适配器**
+
+#### `ensure_sync` 的核心实现
+
+```python
+# src/flask/app.py:1065-1077
+
+def ensure_sync(self, func: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+    """确保函数在同步 WSGI 环境中可以调用
+    
+    - 普通 def 函数：直接返回
+    - async def 协程函数：用 async_to_sync 包装
+    """
+    if iscoroutinefunction(func):
+        # 是异步函数，需要包装
+        return self.async_to_sync(func)
+    
+    # 是同步函数，直接返回
+    return func
+```
+
+#### `async_to_sync` 的实现（依赖 asgiref）
+
+```python
+# src/flask/app.py:1079-1100
+
+def async_to_sync(
+    self, func: t.Callable[..., t.Coroutine[t.Any, t.Any, t.Any]]
+) -> t.Callable[..., t.Any]:
+    """将异步协程函数包装为同步可调用函数
+    
+    依赖 asgiref 库（需要安装 Flask 的 'async' extra）
+    """
+    try:
+        from asgiref.sync import async_to_sync as asgiref_async_to_sync
+    except ImportError:
+        raise RuntimeError(
+            "Install Flask with the 'async' extra in order to use async views."
+        ) from None
+    
+    # asgiref 的 async_to_sync 会：
+    # 1. 创建/获取一个事件循环
+    # 2. 在循环中运行协程直到完成
+    # 3. 返回结果
+    return asgiref_async_to_sync(func)
+```
+
+#### `asgiref.sync.async_to_sync` 的工作原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              async_to_sync 的执行流程                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  同步调用者                                                        │
+│       │                                                           │
+│       ▼                                                           │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  async_to_sync(async_func)(*args, **kwargs)            │   │
+│  │                                                           │   │
+│  │  1. 检查当前线程是否有事件循环                            │   │
+│  │     - 有：使用现有循环（但要小心重入问题）               │   │
+│  │     - 无：创建新的事件循环                                │   │
+│  │                                                           │   │
+│  │  2. 在事件循环中运行协程                                  │   │
+│  │     loop.run_until_complete(async_func(*args, **kwargs))│   │
+│  │                                                           │   │
+│  │  3. 阻塞等待协程完成                                       │   │
+│  │                                                           │   │
+│  │  4. 返回结果（或抛出异常）                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│       │                                                           │
+│       ▼                                                           │
+│  同步调用者继续执行                                                │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**代码示意：**
+
+```python
+# 伪代码：async_to_sync 的核心逻辑
+def async_to_sync(coro_func):
+    def wrapper(*args, **kwargs):
+        import asyncio
+        
+        # 1. 创建协程对象
+        coro = coro_func(*args, **kwargs)
+        
+        # 2. 获取或创建事件循环
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # 3. 阻塞运行协程
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            # 清理（如果是新创建的循环）
+            pass
+    
+    return wrapper
+```
+
+#### `ensure_sync` 在 Flask 中的所有使用场景
+
+从代码搜索结果看，`ensure_sync` 被广泛用于：
+
+| 场景 | 代码位置 | 说明 |
+|------|---------|------|
+| **视图函数** | `app.py:990` | `self.ensure_sync(self.view_functions[...])(...)` |
+| **before_request** | `app.py:1387` | `self.ensure_sync(before_func)()` |
+| **after_request** | `app.py:1408, 1413` | `self.ensure_sync(func)(response)` |
+| **teardown_request** | `app.py:1446` | `self.ensure_sync(func)(exc)` |
+| **teardown_appcontext** | `app.py:1474` | `self.ensure_sync(func)(exc)` |
+| **信号发送** | 多处 | `signal.send(..., _async_wrapper=self.ensure_sync)` |
+| **error_handler** | `app.py:863, 895, 946` | 异常处理器 |
+| **模板上下文** | `app.py:616` | 模板上下文处理器 |
+| **MethodView** | `views.py:110, 116, 191` | 视图类的方法 |
+| **跨线程上下文** | `ctx.py:204` | `copy_current_request_context` |
+
+#### 在 teardown 回调中的具体使用
+
+```python
+# src/flask/app.py:1440-1451 (do_teardown_request)
+
+def do_teardown_request(self, ctx, exc=None):
+    collect_errors = _CollectErrors()
+    
+    # 遍历所有 teardown_request 回调
+    for name in chain(ctx.request.blueprints, (None,)):
+        if name in self.teardown_request_funcs:
+            # 逆序执行（LIFO）
+            for func in reversed(self.teardown_request_funcs[name]):
+                with collect_errors:
+                    # ========== 关键点 ==========
+                    # 用 ensure_sync 包装函数
+                    # - 如果是同步 def：直接调用
+                    # - 如果是 async def：转成同步再调用
+                    self.ensure_sync(func)(exc)
+                    # ============================
+    
+    # 然后发送信号
+    with collect_errors:
+        request_tearing_down.send(
+            self, 
+            _async_wrapper=self.ensure_sync,  # 信号也用同一个适配器
+            exc=exc
+        )
+```
+
+**这意味着你可以写异步的 teardown 回调：**
+
+```python
+@app.teardown_request
+async def async_cleanup(exc):
+    """异步清理函数"""
+    await async_db.close_connection()
+
+# Flask 内部会自动转换：
+# wrapped = ensure_sync(async_cleanup)
+# wrapped(exc)  # 同步调用，内部阻塞等待
+```
+
+#### 在信号发送中的具体使用
+
+```python
+# 发送信号时传入 _async_wrapper
+request_started.send(
+    self, 
+    _async_wrapper=self.ensure_sync  # 关键！
+)
+
+# Blinker 内部的处理（伪代码）
+def send(self, sender, *, _async_wrapper=None, **kwargs):
+    for receiver in self.receivers_for(sender):
+        # 如果有包装器，用它包装接收器
+        if _async_wrapper is not None:
+            receiver = _async_wrapper(receiver)
+            # 此时：
+            # - 同步接收器：不变
+            # - 异步接收器：被 async_to_sync 包装
+        
+        # 调用接收器（现在都是同步的）
+        receiver(sender, **kwargs)
+```
+
+**这样用户可以写异步信号处理器：**
+
+```python
+@request_started.connect_via(app)
+async def async_audit_log(sender, **extra):
+    """异步记录日志"""
+    await async_logger.info("Request started")
+
+# Blinker 内部：
+# receiver = ensure_sync(async_audit_log)  # 转成同步
+# receiver(sender, **extra)  # 同步调用
+```
+
+#### 完整的执行流程示例
+
+```python
+# 用户代码
+app = Flask(__name__)
+
+# 异步视图
+@app.route('/')
+async def async_index():
+    await asyncio.sleep(0.1)  # 异步操作
+    return 'Hello'
+
+# 异步 teardown
+@app.teardown_request
+async def async_teardown(exc):
+    await async_db.close()
+
+# 异步信号处理器
+@request_finished.connect_via(app)
+async def async_signal_handler(sender, response, **extra):
+    await async_metrics.record(response.status_code)
+
+
+# ========== 请求处理时的执行流程 ==========
+
+# wsgi_app() 中
+ctx.push()
+
+# full_dispatch_request()
+request_started.send(self, _async_wrapper=self.ensure_sync)
+# 内部：如果有异步接收器，ensure_sync 包装后再调用
+
+# 调用视图
+view_func = self.view_functions['index']  # async def async_index
+wrapped_view = self.ensure_sync(view_func)  # 转成同步
+response = wrapped_view()  # 同步调用，内部阻塞等待协程
+
+# finalize_request()
+request_finished.send(self, _async_wrapper=self.ensure_sync, response=response)
+# 异步信号处理器被包装后调用
+
+# ctx.pop()
+# do_teardown_request()
+for func in self.teardown_request_funcs[None]:
+    wrapped = self.ensure_sync(func)  # async_teardown 被包装
+    wrapped(exc)  # 同步调用
+```
+
+#### 性能考虑和限制
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    async_to_sync 的代价                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  优点：                                                           │
+│  ✅ 允许用户在同步 WSGI 环境中写异步代码                         │
+│  ✅ 统一的编程模型（同步/异步视图写法类似）                      │
+│  ✅ 可以使用 asyncio 生态的库（aiohttp, asyncpg 等）            │
+│                                                                   │
+│  缺点：                                                           │
+│  ❌ 每个 async_to_sync 调用都有开销（事件循环操作）              │
+│  ❌ 不能真正并行（仍然是阻塞等待）                                │
+│  ❌ 与某些异步框架（如 FastAPI/ASGI）的真正并发不同              │
+│  ❌ 重入问题（在异步代码中再调用 async_to_sync 可能死锁）        │
+│                                                                   │
+│  与纯 ASGI 框架的对比：                                           │
+│                                                                   │
+│  Flask (WSGI + async_to_sync):                                   │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐                  │
+│  │  请求 1  │ → │ 同步阻塞 │ → │  等待... │                  │
+│  └──────────┘    └──────────┘    └──────────┘                  │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐                  │
+│  │  请求 2  │ → │  排队...  │ → │  等待... │                  │
+│  └──────────┘    └──────────┘    └──────────┘                  │
+│                                                                   │
+│  FastAPI/Quart (原生 ASGI):                                       │
+│  ┌─────────────────────────────────────────────────┐            │
+│  │              事件循环                            │            │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐       │            │
+│  │  │ 请求 1  │  │ 请求 2  │  │ 请求 3  │       │            │
+│  │  │ await中 │  │ await中 │  │ await中 │ ← 并行 │            │
+│  │  └─────────┘  └─────────┘  └─────────┘       │            │
+│  └─────────────────────────────────────────────────┘            │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 最佳实践
+
+```python
+# ✅ 推荐：简单的异步操作
+@app.route('/data')
+async def get_data():
+    """使用异步数据库客户端"""
+    data = await async_db.query("SELECT * FROM table")
+    return jsonify(data)
+
+# ✅ 推荐：异步 teardown 清理
+@app.teardown_request
+async def cleanup(exc):
+    await async_db.close()
+
+# ⚠️ 注意：不能在同步代码中直接 await
+@app.route('/')
+def sync_view():
+    # 这会报错！
+    # await some_async_func()
+    
+    # 必须先包装
+    from asgiref.sync import async_to_sync
+    result = async_to_sync(some_async_func)()
+    return result
+
+# ❌ 不推荐：在异步代码中再嵌套 async_to_sync
+@app.route('/')
+async def nested_async():
+    # 这可能导致死锁或性能问题
+    from asgiref.sync import async_to_sync
+    
+    @async_to_sync
+    def inner():
+        # ...
+    
+    inner()  # ❌ 不要这样嵌套
+```
+
+### 4.8.7 信号使用最佳实践
+
+**✅ 推荐的使用场景：**
+
+```python
+# 1. 监控和审计
+from flask import request_started, request_finished
+
+@request_started.connect_via(app)
+def log_request_start(sender, **extra):
+    metrics.increment('requests.total')
+    logger.info(f"Request started at {time.time()}")
+
+# 2. 测试断言
+def test_user_login(app, client):
+    login_events = []
+    
+    def record_login(sender, **extra):
+        if request.endpoint == 'auth.login':
+            login_events.append(True)
+    
+    with user_logged_in.connected_to(record_login, app):
+        client.post('/login', data={'username': 'test'})
+        assert len(login_events) == 1
+
+# 3. 解耦的扩展
+class AnalyticsExtension:
+    def __init__(self, app=None):
+        if app is not None:
+            self.init_app(app)
+    
+    def init_app(self, app):
+        # 不修改应用代码，只通过信号监听
+        from flask import request_finished
+        request_finished.connect(self.track_request, sender=app)
+    
+    def track_request(self, sender, response, **extra):
+        # 发送数据到分析服务
+        self.send_to_analytics(response.status_code)
+```
+
+**❌ 不推荐的使用场景：**
+
+```python
+# ❌ 1. 在信号中修改请求数据
+@request_started.connect_via(app)
+def bad_modify(sender, **extra):
+    # 信号的目的是通知，不是修改
+    # 这会让代码流程变得难以理解
+    from flask import request
+    request.args = {'modified': 'yes'}  # ❌ 不要这样做
+
+# ❌ 2. 在信号中处理业务逻辑
+@got_request_exception.connect_via(app)
+def bad_handle_error(sender, exception, **extra):
+    # 异常处理应该用 errorhandler
+    # 信号只用于记录/通知
+    # return error_page()  # ❌ 信号返回值被忽略
+
+# ✅ 正确方式：用 errorhandler
+@app.errorhandler(500)
+def handle_500(e):
+    return render_template('500.html'), 500
+
+# ❌ 3. 依赖信号的执行顺序
+@request_started.connect_via(app)
+def first(sender, **extra):
+    print("First")
+
+@request_started.connect_via(app)
+def second(sender, **extra):
+    print("Second")
+
+# 信号执行顺序是不确定的！
+# 不要假设 first 一定在 second 之前执行
+# 如果需要顺序，用 before_request 装饰器
+```
+
+**⚠️ 重要注意事项：**
+
+```python
+# 1. 始终使用 **extra 接收参数
+@template_rendered.connect_via(app)
+def good_handler(sender, template, context, **extra):
+    # ✅ 安全：Flask 新增参数不会报错
+    pass
+
+@template_rendered.connect_via(app)
+def bad_handler(sender, template, context):
+    # ❌ 危险：如果 Flask 新增参数，会抛 TypeError
+    pass
+
+# 2. 发送信号时，sender 必须是真实对象，不是代理
+from flask import current_app
+
+# ❌ 错误：current_app 是 LocalProxy
+request_started.send(current_app)
+
+# ✅ 正确：获取真实对象
+request_started.send(current_app._get_current_object())
+
+# 3. 信号是可选依赖
+try:
+    from blinker import signal
+    has_blinker = True
+except ImportError:
+    has_blinker = False
+
+# Flask 的做法：如果没有安装 blinker，信号仍然可以"发送"，
+# 但没有任何效果（send() 是一个空操作）
+```
+
+### 4.8.8 完整信号列表
+
+| 信号名称 | 触发时机 | 传递参数 | 典型用途 |
+|---------|---------|---------|---------|
+| `request_started` | 请求开始，before_request 之前 | `sender` (app) | 监控、统计 |
+| `request_finished` | 请求结束，after_request 之后 | `sender` (app), `response` | 日志、审计 |
+| `request_tearing_down` | teardown_request 回调之后 | `sender` (app), `exc` | 清理通知 |
+| `got_request_exception` | 视图抛出异常时 | `sender` (app), `exception` | 错误报告 |
+| `appcontext_pushed` | 上下文推入后 | `sender` (app) | 初始化 |
+| `appcontext_tearing_down` | teardown_appcontext 之后 | `sender` (app), `exc` | 清理通知 |
+| `appcontext_popped` | 上下文弹出后 | `sender` (app) | 清理 |
+| `before_render_template` | 模板渲染前 | `sender` (app), `template`, `context` | 调试 |
+| `template_rendered` | 模板渲染后 | `sender` (app), `template`, `context` | 测试、调试 |
+| `message_flashed` | 调用 `flash()` 时 | `sender` (app), `message`, `category` | 前端集成 |
+
+---
+
 ## 5. LocalProxy 透明代理原理
 
 ### 5.1 什么是透明代理？
