@@ -360,6 +360,604 @@ with app.app_context():
 
 ---
 
+## 4.5 Flask 3.2 之前：两套独立的上下文
+
+### 4.5.1 历史背景：为什么有两套上下文？
+
+在 Flask 3.2 之前，存在两个独立的上下文类：
+
+| 上下文类型 | 类名 | 作用域 | 核心数据 |
+|-----------|------|--------|---------|
+| **应用上下文** | `AppContext` | 应用级别或请求级别 | `current_app`, `g` |
+| **请求上下文** | `RequestContext` | 单次 HTTP 请求 | `request`, `session` |
+
+**设计初衷：**
+1. **应用上下文**：可以独立于请求存在，用于 CLI 命令、离线脚本等场景
+2. **请求上下文**：必须与 HTTP 请求绑定，包含请求特定的数据
+
+### 4.5.2 合并前的协作逻辑
+
+**关键设计：push RequestContext 会自动带出 AppContext**
+
+```
+请求处理流程（Flask < 3.2）：
+
+1. wsgi_app() 被调用
+        ↓
+2. 创建 RequestContext
+        ↓
+3. RequestContext.push() 执行
+        ↓
+   ┌─────────────────────────────────────────┐
+   │  检查：是否已有 AppContext 存在？        │
+   │         ↓                               │
+   │    ┌─────────┐     ┌──────────────┐   │
+   │   │  不存在  │    │    存在       │   │
+   │    ↓         │     ↓              │   │
+   │  创建并      │    检查：当前      │   │
+   │  push        │    AppContext 是否 │   │
+   │  AppContext  │    属于同一个 app? │   │
+   │              │    ┌─────────┐     │   │
+   │              │   │  是     │ 否  │   │
+   │              │   │  跳过   │ ↓   │   │
+   │              │   │         │push │   │
+   │              │   │         │新的 │   │
+   │              │   │         │AppCtx│   │
+   └──────────────┴───┴─────────┴─────┴───┘
+        ↓
+4. 继续 RequestContext.push 的后续逻辑
+   - 加载 session
+   - 路由匹配
+```
+
+**伪代码示意（Flask < 3.2 的 RequestContext.push）：**
+
+```python
+# Flask 3.2 之前的实现逻辑
+def push(self):
+    # 1. 先处理应用上下文
+    app_ctx = _cv_app.get(None)
+    
+    if app_ctx is None:
+        # 没有应用上下文，创建一个新的
+        app_ctx = self.app.app_context()
+        app_ctx.push()
+        self._implicit_app_ctx_stack.append(app_ctx)
+    else:
+        # 已有应用上下文，检查是否属于同一个 app
+        if app_ctx.app is not self.app:
+            # 不同的 app，需要 push 新的
+            app_ctx = self.app.app_context()
+            app_ctx.push()
+            self._implicit_app_ctx_stack.append(app_ctx)
+    
+    # 2. 再推入请求上下文
+    self._cv_token = _cv_request.set(self)
+    
+    # 3. 加载 session、路由匹配等
+    # ...
+```
+
+### 4.5.3 pop 时的协作逻辑
+
+```
+请求结束时的弹出顺序：
+
+RequestContext.pop() 执行
+        ↓
+   ┌──────────────────────────────┐
+   │  1. 执行 teardown_request    │
+   │  2. 发送 request_tearing_down │
+   │  3. _cv_request.reset(token) │
+   └──────────────────────────────┘
+        ↓
+   ┌──────────────────────────────┐
+   │  检查：_implicit_app_ctx_stack │
+   │  是否有"隐式"推入的 AppContext？│
+   │         ↓                     │
+   │    ┌──────────┐  ┌────────┐ │
+   │   │   有      │ │  无    │ │
+   │   │   ↓       │ │  跳过  │ │
+   │   │ 逐个 pop  │ │        │ │
+   │   │ AppContext │ │        │ │
+   │   └──────────┘ │ └────────┘ │
+   └──────────────────────────────┘
+        ↓
+请求上下文和关联的应用上下文都已弹出
+```
+
+### 4.5.4 为什么要在 3.2 合并？
+
+查看 `CHANGES.rst` 中的变更说明：
+
+```
+Version 3.2.0
+-------------
+- ``RequestContext`` has merged with ``AppContext``. ``RequestContext`` is now
+  a deprecated alias. If an app context is already pushed, it is not reused
+  when dispatching a request. This greatly simplifies the internal code for tracking
+  the active context. :issue:`5639`
+```
+
+**合并的优势：**
+
+| 方面 | 合并前 | 合并后 |
+|------|--------|--------|
+| 复杂度 | 两套栈、两套 push/pop 逻辑、隐式追踪 | 单一 ContextVar，逻辑清晰 |
+| 嵌套处理 | 需要 `_implicit_app_ctx_stack` 追踪"隐式"推入的上下文 | 用 `_push_count` 简单计数 |
+| 代码量 | 需要维护两个类和它们的协作 | 单一 `AppContext` 类 |
+| 理解成本 | 开发者需要理解两套上下文的关系 | 只需理解 `has_request` 属性 |
+
+---
+
+## 4.6 Teardown 回调机制详解
+
+### 4.6.1 回调的注册方式
+
+**两种 teardown 回调：**
+
+| 装饰器 | 触发时机 | 用途 |
+|--------|---------|------|
+| `@app.teardown_request` | 请求上下文弹出时 | 清理请求相关资源（数据库连接等） |
+| `@app.teardown_appcontext` | 应用上下文弹出时 | 清理应用级资源 |
+
+**注册示例：**
+
+```python
+from flask import Flask, g
+import sqlite3
+
+app = Flask(__name__)
+
+# ========== teardown_request：请求级别清理 ==========
+@app.teardown_request
+def close_db_connection(exc):
+    """请求结束时关闭数据库连接"""
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+# ========== teardown_appcontext：应用级别清理 ==========
+@app.teardown_appcontext
+def cleanup_app_resource(exc):
+    """应用上下文结束时的清理"""
+    # 例如：关闭连接池、释放内存等
+    pass
+```
+
+### 4.6.2 内部存储结构
+
+查看 `src/flask/sansio/scaffold.py` 和 `src/flask/sansio/app.py`：
+
+```python
+# ========== teardown_request 的存储 ==========
+# 支持按蓝图分组（None 表示应用级别）
+self.teardown_request_funcs: dict[
+    str | None, list[ft.TeardownCallable]
+] = {None: []}  # None 是应用级别的 key
+
+# 注册时
+@app.teardown_request
+def my_func(exc):
+    pass
+# 等价于：
+self.teardown_request_funcs.setdefault(None, []).append(my_func)
+
+# 蓝图级别的 teardown_request 会有不同的 key
+@bp.teardown_request
+def blueprint_teardown(exc):
+    pass
+# 存储在 teardown_request_funcs[blueprint_name] 中
+
+
+# ========== teardown_appcontext 的存储 ==========
+# 只有应用级别，不区分蓝图
+self.teardown_appcontext_funcs: list[ft.TeardownCallable] = []
+
+# 注册时
+@app.teardown_appcontext
+def my_func(exc):
+    pass
+# 等价于：
+self.teardown_appcontext_funcs.append(my_func)
+```
+
+### 4.6.3 触发时机与执行顺序
+
+**在 `AppContext.pop()` 中的触发逻辑：**
+
+```python
+# src/flask/ctx.py 的 pop() 方法
+
+def pop(self, exc: BaseException | None = None) -> None:
+    # ... 前置检查和 _push_count 处理 ...
+    
+    collect_errors = _CollectErrors()
+    
+    # ========== 1. 先执行 teardown_request（如果有请求）==========
+    if self._request is not None:
+        with collect_errors:
+            self.app.do_teardown_request(self, exc)
+        with collect_errors:
+            self._request.close()
+    
+    # ========== 2. 再执行 teardown_appcontext ==========
+    with collect_errors:
+        self.app.do_teardown_appcontext(self, exc)
+    
+    # ========== 3. 恢复 ContextVar ==========
+    _cv_app.reset(self._cv_token)
+    self._cv_token = None
+    
+    # ... 发送信号 ...
+```
+
+**`do_teardown_request` 的详细实现：**
+
+```python
+# src/flask/app.py
+
+def do_teardown_request(
+    self, ctx: AppContext, exc: BaseException | None = None
+) -> None:
+    collect_errors = _CollectErrors()
+    
+    # 执行顺序：蓝图级别 → 应用级别
+    # ctx.request.blueprints 是蓝图名称列表（按嵌套顺序）
+    for name in chain(ctx.request.blueprints, (None,)):
+        if name in self.teardown_request_funcs:
+            # 反向执行：后注册的先执行（LIFO）
+            for func in reversed(self.teardown_request_funcs[name]):
+                with collect_errors:
+                    self.ensure_sync(func)(exc)  # 传入异常参数
+    
+    # 发送信号
+    with collect_errors:
+        request_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
+    
+    collect_errors.raise_any("Errors during request teardown")
+```
+
+**`do_teardown_appcontext` 的实现：**
+
+```python
+def do_teardown_appcontext(
+    self, ctx: AppContext, exc: BaseException | None = None
+) -> None:
+    collect_errors = _CollectErrors()
+    
+    # 反向执行：后注册的先执行
+    for func in reversed(self.teardown_appcontext_funcs):
+        with collect_errors:
+            self.ensure_sync(func)(exc)
+    
+    # 发送信号
+    with collect_errors:
+        appcontext_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
+    
+    collect_errors.raise_any("Errors during app teardown")
+```
+
+### 4.6.4 异常参数 `exc` 的传递规则
+
+| 场景 | `exc` 的值 |
+|------|-----------|
+| 请求正常完成，无异常 | `None` |
+| 请求中抛出异常，但被 `@app.errorhandler` 处理 | `None`（已处理的异常不传递） |
+| 请求中抛出未处理的异常 | 异常对象本身 |
+
+**设计意图：**
+- 让 teardown 函数知道"是否因异常而结束"
+- 可以根据情况执行不同的清理逻辑（如回滚事务）
+
+```python
+@app.teardown_request
+def cleanup_session(exc):
+    if exc is not None:
+        # 有异常，回滚事务
+        db.session.rollback()
+    else:
+        # 正常结束，提交事务
+        db.session.commit()
+    db.session.remove()
+```
+
+### 4.6.5 Flask 3.2 的重要改进
+
+查看 `CHANGES.rst`：
+
+```
+- All teardown callbacks are called, even if any raise an error. :pr:`5928`
+```
+
+**改进对比：**
+
+| 行为 | Flask < 3.2 | Flask ≥ 3.2 |
+|------|-------------|-------------|
+| 某个 teardown 抛出异常 | 立即停止，后续回调不执行 | 继续执行所有回调，最后汇总抛出 |
+
+**实现方式：`_CollectErrors` 上下文管理器**
+
+```python
+# 伪代码示意
+class _CollectErrors:
+    def __init__(self):
+        self.errors = []
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_value, tb):
+        if exc_value is not None:
+            # 捕获异常，不继续抛出
+            self.errors.append(exc_value)
+            return True  # 抑制异常
+    
+    def raise_any(self, message):
+        if self.errors:
+            # 所有回调执行完后，汇总抛出
+            raise ExceptionGroup(message, self.errors)
+```
+
+**使用方式：**
+
+```python
+collect_errors = _CollectErrors()
+
+# 每个回调都在 collect_errors 上下文中执行
+with collect_errors:
+    func1(exc)  # 即使抛异常，也会被捕获
+
+with collect_errors:
+    func2(exc)  # 继续执行
+
+# 最后检查是否有错误
+collect_errors.raise_any("Errors during teardown")
+```
+
+---
+
+## 4.7 Token Reset 的异常清理保证机制
+
+### 4.7.1 为什么需要保证？
+
+如果在请求处理过程中发生异常，上下文必须被正确弹出，否则：
+- ContextVar 会"泄露"到后续请求
+- 资源无法释放
+- 后续请求可能读到前一个请求的数据
+
+### 4.7.2 多层保证机制
+
+Flask 通过 **三层防御** 确保上下文正确清理：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  第一层：try...finally 在 wsgi_app() 中                          │
+│                                                                   │
+│  def wsgi_app(self, environ, start_response):                    │
+│      ctx = self.request_context(environ)                         │
+│      error = None                                                 │
+│      try:                                                         │
+│          try:                                                     │
+│              ctx.push()                                            │
+│              response = self.full_dispatch_request(ctx)          │
+│          except Exception as e:                                   │
+│              error = e                                            │
+│              response = self.handle_exception(ctx, e)            │
+│          return response(environ, start_response)                │
+│      finally:                                                     │
+│          # 无论成功失败，一定会执行！                             │
+│          ctx.pop(error)  ◄────────────────────────────────────┐ │
+│      └─────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  第二层：ContextVar.set() + reset() 的 Token 机制               │
+│                                                                   │
+│  def push(self):                                                  │
+│      # set() 返回一个 Token，记录"设置前的状态"                  │
+│      self._cv_token = _cv_app.set(self)                         │
+│                      ↓                                           │
+│              ┌─────────────────────┐                              │
+│              │ Token 包含：         │                              │
+│              │ - var: ContextVar   │                              │
+│              │ - old_value: 旧值   │                              │
+│              └─────────────────────┘                              │
+│                                                                   │
+│  def pop(self, exc):                                              │
+│      # 用 Token 恢复到设置前的状态                                │
+│      _cv_app.reset(self._cv_token)  ◄─────────────────────────┐ │
+│      self._cv_token = None                                      │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  第三层：上下文管理器协议（__enter__ / __exit__）               │
+│                                                                   │
+│  手动使用时：                                                      │
+│                                                                   │
+│  with app.app_context():     # 调用 __enter__ → push()         │
+│      # 使用 current_app                                          │
+│      pass                                                         │
+│  # 退出 with 块时，自动调用 __exit__ → pop()                    │
+│  # 即使块内抛异常，__exit__ 也会执行！                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.7.3 Token 机制的工作原理
+
+**ContextVar 的核心 API：**
+
+```python
+from contextvars import ContextVar
+
+cv = ContextVar("my_var", default="initial")
+
+# ========== 基础用法 ==========
+token = cv.set("new_value")
+assert cv.get() == "new_value"
+
+# reset 恢复到 set() 之前的状态
+cv.reset(token)
+assert cv.get() == "initial"
+
+
+# ========== 嵌套场景 ==========
+token1 = cv.set("value1")
+assert cv.get() == "value1"
+
+token2 = cv.set("value2")  # 嵌套设置
+assert cv.get() == "value2"
+
+cv.reset(token2)  # 恢复到 value1
+assert cv.get() == "value1"
+
+cv.reset(token1)  # 恢复到 initial
+assert cv.get() == "initial"
+
+
+# ========== 异常场景 ==========
+token = cv.set("temporary")
+try:
+    raise RuntimeError("something went wrong")
+finally:
+    # 即使抛异常，也要 reset！
+    cv.reset(token)
+
+# 外部不受影响
+assert cv.get() == "initial"
+```
+
+**Token 与栈的等价性：**
+
+```
+使用 Token 实现的"栈"效果：
+
+操作序列：              ContextVar 值：        Token 链：
+────────────────────────────────────────────────────────────
+初始状态               "initial"              (no tokens)
+                        ↑
+cv.set("A")            "A"                    token1 → "initial"
+                        ↑
+cv.set("B")            "B"                    token2 → "A"
+                        ↑
+cv.reset(token2)       "A"                    (token2 已使用)
+                        ↑
+cv.reset(token1)       "initial"              (token1 已使用)
+```
+
+### 4.7.4 Flask 中的嵌套上下文处理
+
+**`_push_count` 计数器的作用：**
+
+```python
+class AppContext:
+    def __init__(self, ...):
+        self._push_count: int = 0
+        self._cv_token: ... = None
+    
+    def push(self):
+        self._push_count += 1
+        
+        # 只有第一次 push 才真正设置 ContextVar
+        if self._cv_token is not None:
+            return  # 已推入，直接返回
+        
+        self._cv_token = _cv_app.set(self)
+        # ... 其他初始化
+    
+    def pop(self, exc=None):
+        # 只有 _push_count 归零时才真正 reset
+        self._push_count -= 1
+        if self._push_count > 0:
+            return  # 还有嵌套，不真正弹出
+        
+        # ... 执行 teardown
+        
+        _cv_app.reset(self._cv_token)
+        self._cv_token = None
+```
+
+**嵌套场景示例：**
+
+```python
+ctx = app.app_context()
+
+# ========== 第一次 push ==========
+ctx.push()
+# _push_count = 1
+# _cv_token 被设置，ContextVar 指向 ctx
+assert current_app._get_current_object() is app
+
+# ========== 第二次 push（嵌套）==========
+ctx.push()
+# _push_count = 2
+# _cv_token 已存在，直接返回！
+# ContextVar 仍然指向同一个 ctx
+assert current_app._get_current_object() is app  # 不变
+
+# ========== 第一次 pop ==========
+ctx.pop()
+# _push_count = 1
+# 大于 0，不执行 reset！
+assert current_app._get_current_object() is app  # 仍然可用！
+
+# ========== 第二次 pop ==========
+ctx.pop()
+# _push_count = 0
+# 执行 teardown，reset ContextVar
+# current_app 现在不可用
+```
+
+### 4.7.5 为什么这种设计是安全的？
+
+| 风险点 | 防护机制 |
+|--------|---------|
+| 视图函数抛异常 | `wsgi_app` 的 `finally` 保证 `ctx.pop()` 执行 |
+| `teardown_request` 抛异常 | `_CollectErrors` 捕获，`reset` 仍会执行 |
+| `teardown_appcontext` 抛异常 | 同上 |
+| 上下文管理器内抛异常 | `__exit__` 保证 `pop()` 执行 |
+| 嵌套推入/弹出 | `_push_count` 确保只在最后一次真正 reset |
+
+**极端场景的保证：**
+
+```python
+# 即使所有 teardown 都抛异常，reset 仍然执行！
+
+def pop(self, exc=None):
+    # ... _push_count 检查 ...
+    
+    collect_errors = _CollectErrors()
+    
+    # 即使这些回调抛异常，也被 collect_errors 捕获
+    if self._request is not None:
+        with collect_errors:
+            self.app.do_teardown_request(self, exc)
+        with collect_errors:
+            self._request.close()
+    
+    with collect_errors:
+        self.app.do_teardown_appcontext(self, exc)
+    
+    # ========== 关键：reset 不在 collect_errors 中！ ==========
+    # 这意味着即使前面都抛异常，reset 一定执行！
+    _cv_app.reset(self._cv_token)  # ← 一定会执行！
+    self._cv_token = None
+    
+    with collect_errors:
+        appcontext_popped.send(...)
+    
+    # 最后才抛出收集到的异常
+    collect_errors.raise_any(...)
+```
+
+**`reset` 放在 `teardown` 之后的原因：**
+- teardown 回调可能需要访问 `current_app`、`request` 等
+- 必须在 teardown 全部执行完后再 reset
+- 但 `reset` 本身不会失败（只要 token 有效），所以放在 `collect_errors` 之外
+
+---
+
 ## 5. LocalProxy 透明代理原理
 
 ### 5.1 什么是透明代理？
